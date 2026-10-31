@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xkan"
+dynamic = ["version"]
+description = "Kolmogorov-Arnold Networks: networks of KAN layers, training, interpretation and symbolic regression"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ziming Liu" }]
+maintainers = [{ name = "Marcin Malec" }]
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.14",
+    "numpy>=2.5",
+    "sympy>=1.14",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/khazum/xkan"
+Issues = "https://github.com/khazum/xkan/issues"
+Changelog = "https://github.com/khazum/xkan/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.11"]
+contrib = ["matplotlib>=3.11", "scikit-learn>=1.9", "tqdm>=4.70"]  # xkan.contrib: hypothesis tests, MLP baseline
+dev = ["pytest>=8.4", "ruff>=0.14", "matplotlib>=3.11", "scikit-learn>=1.9", "tqdm>=4.70"]
+docs = ["sphinx>=9", "sphinx-rtd-theme>=3", "myst-nb>=1.4", "matplotlib>=3.11"]
+
+[tool.setuptools.packages.find]
+include = ["xkan*"]
+
+[tool.setuptools.package-data]
+xkan = ["assets/img/*.png"]
+
+[tool.setuptools.dynamic]
+version = { attr = "xkan.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["docs", "tutorials"]
+
+[tool.ruff.lint]
+select = ["F", "E9", "W6", "B006", "B008"]

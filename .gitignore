@@ -1,0 +1,18 @@
+__pycache__/
+.DS_Store
+.ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
+# Sphinx output and the notebooks conf.py copies in
+docs/_build/
+docs/_static/
+docs/_templates
+docs/_notebooks/
+# files the tutorials write or download
+model/
+figures/
+video_img/
+*.mp4
+runs/
+knot_data.csv
