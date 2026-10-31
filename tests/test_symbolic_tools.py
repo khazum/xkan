@@ -172,20 +172,29 @@ def test_a_range_relative_modes():
 
 def test_blocked_grid_search_agrees_with_the_whole_grid():
     # the grid search in cache-sized blocks of rows of a (SWEEP_BLOCK_ELEMENTS) against the whole grid at once: the same
-    # best cells and parameters up to the rounding of the sums
+    # fits up to the rounding of the sums. The test compares the fitted curves c f(a x + b) + d and their r2, since
+    # c (a x + b)^2 + d gives one curve for every (k a, k b, c / k^2): which of those grid cells wins depends on the
+    # rounding, and so on the number of threads.
     import xkan.symbolic.fitting as F
     torch.manual_seed(0)
     x = torch.rand(400) * 2 - 1
     y = torch.sin(2 * x + 0.3) + 0.05 * torch.randn(400)
     X, Y = torch.rand(5, 300) * 2 - 1, torch.cos(3 * torch.rand(5, 300))
+    fns = (torch.sin, torch.exp, lambda t: t ** 2)
+
+    def curve(p, fn, inputs):
+        return p[..., 2:3] * fn(p[..., 0:1] * inputs + p[..., 1:2]) + p[..., 3:4]
+
     saved = F.SWEEP_BLOCK_ELEMENTS
     try:
         out = {}
         for block in (None, 2**14):
             F.SWEEP_BLOCK_ELEMENTS = block
-            out[block] = [F.fit_params(x, y, fn, verbose=False) for fn in (torch.sin, torch.exp, lambda t: t ** 2)]
+            out[block] = [F.fit_params(x, y, fn, verbose=False) for fn in fns]
             out[block].append(F.fit_params_batched(X, Y, torch.cos))
-        for (pa, ra), (pb, rb) in zip(out[None], out[2**14]):
-            assert torch.allclose(pa, pb, rtol=1e-4, atol=1e-5) and torch.allclose(ra, rb, atol=1e-6)
+        cases = [(fn, x) for fn in fns] + [(torch.cos, X)]
+        for (fn, inputs), (pa, ra), (pb, rb) in zip(cases, out[None], out[2**14]):
+            assert torch.allclose(ra, rb, atol=1e-6)
+            assert torch.allclose(curve(pa, fn, inputs), curve(pb, fn, inputs), rtol=1e-4, atol=1e-4)
     finally:
         F.SWEEP_BLOCK_ELEMENTS = saved
