@@ -120,6 +120,37 @@ class Logger(Callback):
             print(f"step {step}: " + " | ".join(f"{k} {float(logs[k]):.3e}" for k in keys if k in logs))
 
 
+class SplineShare(Callback):
+    """
+    Record each KAN layer's spline share (xkan.interp.spline_share) on x every `every` steps (and after the fit) in
+    self.records, a list of {"step": step, <layer name>: share, ...}: a share falling towards 0 is a spline collapse
+    (a weight decay on the spline scales and coefficients does it).
+    """
+
+    def __init__(self, x, every=10, rows=256):
+        if every < 1:
+            raise ValueError("every must be at least 1")
+        self.x, self.every, self.rows, self.records = x, every, rows, []
+
+    def _record(self, trainer, step):
+        from ..interp.diagnostics import spline_share
+        self.records.append({"step": step, **spline_share(trainer.model, self.x, rows=self.rows, **trainer.forward_kwargs)})
+
+    def on_step_end(self, trainer, step, logs):
+        if step % self.every == 0:
+            self._record(trainer, step)
+
+    def on_fit_end(self, trainer):
+        if not self.records or self.records[-1]["step"] != trainer.fit_step:
+            self._record(trainer, trainer.fit_step)
+
+    def state_dict(self):
+        return {"records": list(self.records)}
+
+    def load_state_dict(self, state):
+        self.records = list(state.get("records", []))
+
+
 class Figures(Callback):
     """save xkan.viz.plot(model, data, **plot_kwargs) of a KANNetwork as folder/<step>.jpg every `every` steps (the frames
     of a training video)"""

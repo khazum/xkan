@@ -11,6 +11,9 @@ class Zero(torch.nn.Module):
         return x * 0.
 
 
+# what an edge does with an input outside its grid's inner range (KANLayer)
+OUT_OF_GRID = ("zero", "clamp", "soft_clamp")
+
 # base functions b(x) of the residual path, by name
 BASE_FUNCTIONS = {"silu": torch.nn.SiLU, "identity": torch.nn.Identity, "zero": Zero, "gelu": torch.nn.GELU,
                   "relu": torch.nn.ReLU, "tanh": torch.nn.Tanh}
@@ -56,6 +59,7 @@ class KANLayerConfig:
     dropkan: float = 0.0
     aggregation: str = "sum"
     bias: bool = False
+    out_of_grid: str = "zero"
 
     def __post_init__(self):
         from .bases import BASES
@@ -68,6 +72,8 @@ class KANLayerConfig:
             raise ValueError(f"unknown basis {self.basis!r}; one of {sorted(BASES)}")
         if self.knot_placement not in KNOT_PLACEMENTS:
             raise ValueError(f"unknown knot_placement {self.knot_placement!r}; one of {sorted(KNOT_PLACEMENTS)}")
+        if self.out_of_grid not in OUT_OF_GRID:
+            raise ValueError(f"unknown out_of_grid {self.out_of_grid!r}; one of {OUT_OF_GRID}")
         if self.aggregation not in ("sum", "mean"):
             raise ValueError(f"unknown aggregation {self.aggregation!r}; 'sum' or 'mean'")
         if not 0. <= float(self.dropkan) < 1.:

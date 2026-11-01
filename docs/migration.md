@@ -29,6 +29,13 @@ Conventions:
 - `KANNetwork` divides the initial spline scales by the square root of each layer's number of inputs, as pykan 0.2.8
   does. `scale_sp_fan_in=False` starts them at full strength, as pykan 0.2.7 and earlier did; several tutorials
   assume that.
+- Attribution and pruning weigh every output 1 (`output_weighting='sum'`). pykan weighs each by 1 / outputs, which
+  with many outputs puts every edge under the pruning thresholds; `output_weighting='mean'` restores it. Networks
+  with one output score the same either way.
+- Pruning leaves every output a path from the inputs (`keep_paths=True`), so no output turns constant;
+  `xkan.interp.disconnected_outputs(model)` lists outputs that have none.
+- The trainer's weight decay leaves the spline coefficients and scales alone (`Trainer(spline_weight_decay=0.)`);
+  decay on them shrinks the splines to zero. `spline_weight_decay=None` decays every parameter, as torch does.
 
 | 0.2.x | 1.0 |
 |---|---|

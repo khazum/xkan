@@ -26,9 +26,9 @@ def reference_reg(net, rec, metric, l1, entropy, coef, coefdiff):
                        "edge_forward_sum": torch.std(r.edge_outputs[l], dim=0) / rng,
                        "edge_forward_spline_u": torch.std(r.edge_numeric[l], dim=0)}.get(metric))
     if metric == "edge_backward":
-        scales = network_attribution(net, r, per_output=False).edge
+        scales = network_attribution(net, r, per_output=False, output_weighting="mean").edge
     if metric == "node_backward":
-        scales = node_attribution(net, r)
+        scales = node_attribution(net, r, output_weighting="mean")
     if metric == "edge_weights":  # efficient-KAN's: from the weights alone, per edge |scale_sp| mean_g |coef|
         scales = [torch.stack([torch.stack([layer.scale_sp[i, j].abs() * layer.coef[i, j].abs().mean() * layer.mask[i, j]
                                             for i in range(layer.in_dim)]) for j in range(layer.out_dim)])

@@ -30,6 +30,11 @@ class Trainer:
     callbacks : xkan.train callbacks (GridUpdate, EarlyStopping, BestState, Logger, ...)
     scheduler : a learning-rate scheduler of the optimizer or a function optimizer -> scheduler, stepped per step
         (scheduler_interval='step') or per epoch (default; a step of in-memory data counts as an epoch)
+    spline_weight_decay : the weight decay of the KAN layers' spline coefficients and scales (coef, scale_sp), in a
+        parameter group of their own, for an optimizer the trainer builds (a name or a class): 0 (default) keeps the
+        optimizer's weight_decay on the other parameters only; None leaves the splines with it. A weight decay on them
+        shrinks the spline scales to zero within a few epochs and leaves the base path alone (a linear network under
+        an identity base). An optimizer instance keeps its own parameter groups; LBFGS has no weight decay
     grad_clip : clip the gradient norm to this value
     amp : mixed precision (torch.autocast; float16 on CUDA with gradient scaling, else bfloat16); not with LBFGS
     forward_kwargs : keyword arguments of every forward (singularity_avoiding=True, say)
@@ -43,7 +48,7 @@ class Trainer:
 
     def __init__(self, model, loss, optimizer="adam", lr=None, *, callbacks=(), batch_size=None, seed=0,
                  scheduler=None, scheduler_interval="epoch", grad_clip=None, amp=False, optimizer_options=None,
-                 forward_kwargs=None, eval_every=1, eval_rows=None):
+                 spline_weight_decay=0., forward_kwargs=None, eval_every=1, eval_rows=None):
         self.model, self.loss = model, loss
         self.callbacks = list(callbacks)
         self.batch_size = batch_size
@@ -52,6 +57,7 @@ class Trainer:
         self.rng = np.random.default_rng(seed)
         self.forward_kwargs = dict(forward_kwargs or {})
         self.grad_clip, self.eval_every, self.eval_rows = grad_clip, eval_every, eval_rows
+        self.spline_weight_decay = spline_weight_decay
         self.optimizer = self._optimizer(optimizer, lr, dict(optimizer_options or {}))
         self.is_lbfgs = isinstance(self.optimizer, (LBFGS, torch.optim.LBFGS))
         if scheduler is not None and not hasattr(scheduler, "step"):
@@ -75,11 +81,25 @@ class Trainer:
         p = next(self.model.parameters(), None)
         return p.device if p is not None else torch.device("cpu")
 
-    def _optimizer(self, optimizer, lr, options):
+    def _params(self, grouped=True):
+        """the trainable parameters, or (grouped, spline_weight_decay not None) two groups: the rest, and the KAN
+        layers' spline coefficients and scales with that decay"""
         params = [p for p in self.model.parameters() if p.requires_grad]
+        if self.spline_weight_decay is None or not grouped:
+            return params
+        spline = {id(p) for m in self.model.modules() if isinstance(m, KANLayer) for p in (m.coef, m.scale_sp)
+                  if p.requires_grad}
+        groups = [{"params": [p for p in params if id(p) not in spline]},
+                  {"params": [p for p in params if id(p) in spline], "weight_decay": float(self.spline_weight_decay)}]
+        return [g for g in groups if g["params"]]
+
+    def _optimizer(self, optimizer, lr, options):
+        decay = self.spline_weight_decay not in (None, 0.)
         if isinstance(optimizer, torch.optim.Optimizer):
             if lr is not None or options:
                 raise ValueError("lr and optimizer_options go with an optimizer name or class, not an instance")
+            if decay:
+                raise ValueError("spline_weight_decay goes with an optimizer name or class, not an instance")
             return optimizer
         if isinstance(optimizer, str):
             name = optimizer.lower()
@@ -87,10 +107,13 @@ class Trainer:
                 raise ValueError(f"unknown optimizer {optimizer!r}; one of {sorted(DEFAULT_LR)}, a class or an instance")
             lr = DEFAULT_LR[name] if lr is None else lr
             if name in ("lbfgs", "torch_lbfgs"):
+                if decay:
+                    raise ValueError("LBFGS has no weight decay: spline_weight_decay goes with adam, adamw or sgd")
                 options = {**LBFGS_OPTIONS, **({"tolerance_ys": 1e-32} if name == "lbfgs" else {}), **options}
-                return (LBFGS if name == "lbfgs" else torch.optim.LBFGS)(params, lr=lr, **options)
-            return {"adam": torch.optim.Adam, "adamw": torch.optim.AdamW, "sgd": torch.optim.SGD}[name](params, lr=lr, **options)
-        return optimizer(params, **({} if lr is None else {"lr": lr}), **options)
+                return (LBFGS if name == "lbfgs" else torch.optim.LBFGS)(self._params(grouped=False), lr=lr, **options)
+            optimizer = {"adam": torch.optim.Adam, "adamw": torch.optim.AdamW, "sgd": torch.optim.SGD}[name]
+            return optimizer(self._params(), lr=lr, **options)
+        return optimizer(self._params(), **({} if lr is None else {"lr": lr}), **options)
 
     # ------------------------------------------------------------------------------------------------- modes
 

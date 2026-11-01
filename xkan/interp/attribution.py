@@ -30,7 +30,7 @@ def _node_to_subnode(score, width, arities):
     return torch.cat(parts, dim=1)
 
 
-def network_attribution(network, record, *, layer=None, out_score=None, per_output=True, output_weighting="mean"):
+def network_attribution(network, record, *, layer=None, out_score=None, per_output=True, output_weighting="sum"):
     """
     The attribution of network from its record (a NetworkRecord with at least 2 samples; autograd graphs kept, so
     that regularisers differentiate through the scores).
@@ -40,7 +40,9 @@ def network_attribution(network, record, *, layer=None, out_score=None, per_outp
     out_score : the weights of the nodes it starts from (default: ones)
     per_output : from the outputs, one track per output node (True, default) or one averaged track (the same
         averages, memory independent of the number of outputs)
-    output_weighting : 'mean' (default; every output weighs 1 / outputs, pykan's) or 'sum' (every output weighs 1)
+    output_weighting : 'sum' (default; every output weighs 1, so the scores of a network's last layer are each edge's
+        share of its output whatever the number of outputs) or 'mean' (pykan's: every output weighs 1 / outputs, which
+        with many outputs puts every score below pykan's pruning thresholds)
     """
     if output_weighting not in ("mean", "sum"):
         raise ValueError(f"unknown output_weighting {output_weighting!r}; 'mean' or 'sum'")
@@ -72,6 +74,7 @@ def network_attribution(network, record, *, layer=None, out_score=None, per_outp
     return Attribution(node_all, edge_all, subnode_all, mean(node_all), mean(edge_all), mean(subnode_all))
 
 
-def node_attribution(network, record):
+def node_attribution(network, record, output_weighting="sum"):
     """per node layer l = 1 .. L: (width_in[l], width_in[0]), the attribution of each node of layer l to the inputs"""
-    return [network_attribution(network, record, layer=l).node_all[0] for l in range(1, network.depth + 1)]
+    return [network_attribution(network, record, layer=l, output_weighting=output_weighting).node_all[0]
+            for l in range(1, network.depth + 1)]

@@ -98,7 +98,7 @@ def reindex_nodes(net, l, node_map, new_arities=()):
 
 # ----------------------------------------------------------------------------------------------------- attribution
 
-def attribute(net, data, *, layer=None, out_score=None, per_output=True, output_weighting="mean", **forward_kwargs):
+def attribute(net, data, *, layer=None, out_score=None, per_output=True, output_weighting="sum", **forward_kwargs):
     """the Attribution (xkan.interp.attribution) of net from a forward of data"""
     rec, _ = recorded(net, data, **forward_kwargs)
     return network_attribution(net, rec, layer=layer, out_score=out_score, per_output=per_output,
@@ -110,11 +110,11 @@ def feature_score(net, data, **kw):
     return attribute(net, data, per_output=False, **kw).node[0]
 
 
-def feature_interaction(net, data, l, neuron_th=1e-2, feature_th=1e-2):
+def feature_interaction(net, data, l, neuron_th=1e-2, feature_th=1e-2, *, output_weighting="sum"):
     """{tuple of inputs: count} over the nodes of node layer l whose score exceeds neuron_th: the inputs above
     feature_th times the node's largest input score"""
     rec, _ = recorded(net, data)
-    scores = network_attribution(net, rec, layer=l).node_all[0]  # (width_in[l], width_in[0])
+    scores = network_attribution(net, rec, layer=l, output_weighting=output_weighting).node_all[0]  # (width_in[l], width_in[0])
     groups = {}
     for score in scores:
         if torch.max(score) > neuron_th:
@@ -123,18 +123,87 @@ def feature_interaction(net, data, l, neuron_th=1e-2, feature_th=1e-2):
     return groups
 
 
+# ----------------------------------------------------------------------------------------------------- paths
+
+def _edges_present(net):
+    """per layer (in, out) bool on the CPU: a numeric (mask != 0) or symbolic edge"""
+    return [((layer.mask != 0) | (sym.mask.T != 0)).cpu() for layer, sym in zip(net.layers, net.symbolic)]
+
+
+def _connected(cfg, edges, nodes):
+    """per node layer (width_in[l],) bool: reached from a kept input through kept nodes and edges (a multiplication
+    node through any of its subnodes)"""
+    conn = [nodes[0].clone()]
+    for l in range(cfg.depth):
+        sub = (edges[l] & conn[l][:, None]).any(dim=0)
+        n_sum = cfg.width[l + 1][0]
+        node = [sub[:n_sum]] + [sub[_subnodes(cfg, l + 1, n)].any()[None] for n in range(n_sum, cfg.width_in[l + 1])]
+        conn.append(torch.cat(node) & nodes[l + 1])
+    return conn
+
+
+def _reconnect(cfg, scores, exists, edges, nodes, conn, l, n):
+    # gives node n of node layer l a path: its highest-scoring existing edge whose source is reached or can be given
+    # a path itself (the same way); edges and nodes updated, True when found
+    subs = _subnodes(cfg, l, n)
+    cand = exists[l - 1][:, subs]  # (in, subnodes)
+    sc = torch.where(cand, scores[l - 1][subs, :].T, torch.tensor(-float("inf")))
+    for flat in torch.argsort(sc.flatten(), descending=True)[:int(cand.sum())].tolist():
+        i, s = divmod(flat, len(subs))
+        if l - 1 == 0 or conn[l - 1][i] or _reconnect(cfg, scores, exists, edges, nodes, conn, l - 1, i):
+            edges[l - 1][i, subs[s]] = True
+            nodes[l - 1][i] = True
+            return True
+    return False
+
+
+def _keep_paths(cfg, scores, exists, edges, nodes):
+    """
+    Gives every output that had a path (through exists) a path again: greedily from the output back, its
+    highest-scoring edge from a node that is reached or can be reached the same way; edges and nodes (per layer / node
+    layer, bool on the CPU) updated in place. Returns the outputs left without a path (they had none).
+    """
+    scores = [s.detach().float().cpu() for s in scores]
+    had = _connected(cfg, exists, [torch.ones(w, dtype=torch.bool) for w in cfg.width_in])[-1]
+    conn = _connected(cfg, edges, nodes)
+    for j in torch.where(had & ~conn[-1])[0].tolist():
+        if _reconnect(cfg, scores, exists, edges, nodes, conn, cfg.depth, j):
+            conn = _connected(cfg, edges, nodes)
+    return torch.where(~conn[-1])[0].tolist()
+
+
+def disconnected_outputs(net):
+    """the outputs of net that no path of numeric or symbolic edges joins to an input: constants"""
+    cfg = net.config
+    conn = _connected(cfg, _edges_present(net), [torch.ones(w, dtype=torch.bool) for w in cfg.width_in])
+    return torch.where(~conn[-1])[0].tolist()
+
+
+def _fold(net, l, mean_out):
+    # constant edge outputs (out,) of layer l into the layer's bias when it has one, else the subnode bias
+    layer = net.layers[l]
+    if layer.bias is not None:
+        layer.bias.data.add_(mean_out.to(layer.bias.dtype))
+    else:
+        net.subnode_bias[l].data.add_(net.subnode_scale[l] * mean_out.to(net.subnode_bias[l].dtype))
+
+
 # ----------------------------------------------------------------------------------------------------- pruning
 
-def prune_node(net, data, threshold=1e-2, *, keep=None, output_weighting="mean", fold_constants=True):
+def prune_node(net, data, threshold=1e-2, *, keep=None, output_weighting="sum", fold_constants=True, keep_paths=True):
     """
     A network without the hidden nodes whose attribution score is at most threshold (keep: per hidden node layer
     the nodes to keep instead). fold_constants: the mean outputs (over data) of the removed nodes' edges move into
-    the biases of the subnodes they fed, so the pruned network's output does not shift by them. A layer keeps at
-    least its most important node.
+    the biases they fed (the layer's bias, or the subnode's), so the pruned network's output does not shift by them.
+    A layer keeps at least its most important node; with keep_paths (and no keep) every output that had a path from
+    the inputs keeps its best one (disconnected_outputs lists any left constant).
+    output_weighting : 'sum' (default; every output weighs 1, so an edge into an output scores its share of that
+        output whatever the number of outputs) or 'mean' (pykan's: every output weighs 1 / outputs)
     """
     rec, _ = recorded(net, data)
-    scores = network_attribution(net, rec, per_output=False, output_weighting=output_weighting).node
-    kept = []
+    attribution = network_attribution(net, rec, per_output=False, output_weighting=output_weighting)
+    scores = attribution.node
+    masks = []
     for l in range(1, net.depth):
         if keep is not None:
             mask = torch.zeros(net.width_in[l], dtype=torch.bool)
@@ -145,7 +214,13 @@ def prune_node(net, data, threshold=1e-2, *, keep=None, output_weighting="mean",
                 mask[int(torch.argmax(scores[l]))] = True
                 warnings.warn(f"prune_node: no node of layer {l} is above threshold {threshold}; its most important "
                               "node is kept")
-        kept.append(torch.where(mask)[0].tolist())
+        masks.append(mask)
+    if keep is None and keep_paths:
+        ones = lambda w: torch.ones(w, dtype=torch.bool)  # noqa: E731
+        edges = _edges_present(net)
+        _keep_paths(net.config, attribution.edge, edges, [e.clone() for e in edges],
+                    [ones(net.width_in[0])] + masks + [ones(net.width_in[-1])])
+    kept = [torch.where(mask)[0].tolist() for mask in masks]
     new = copy.deepcopy(net)
     if fold_constants:
         with torch.no_grad():
@@ -153,52 +228,118 @@ def prune_node(net, data, threshold=1e-2, *, keep=None, output_weighting="mean",
                 removed = torch.ones(net.width_in[l], dtype=torch.bool, device=net.device)
                 removed[kept[l - 1]] = False
                 if removed.any():
-                    mean_out = rec.edge_outputs[l][:, :, removed].mean(dim=0).sum(dim=1)
-                    new.subnode_bias[l].add_(new.subnode_scale[l] * mean_out.to(new.subnode_bias[l].dtype))
+                    _fold(new, l, rec.edge_outputs[l][:, :, removed].mean(dim=0).sum(dim=1))
     for l in range(1, net.depth):
         new = reindex_nodes(new, l, kept[l - 1])
     return new
 
 
-def prune_edge(net, data, threshold=3e-2, *, output_weighting="mean", fold_constants=True):
+def _mask_edges(net, rec, scores, keep, *, fold_constants=True, keep_paths=True):
+    # masks, in place, the numeric edges of net outside keep (per layer (in, out) bool), first giving back to every
+    # output that had a path its best one (keep_paths); the removed edges' mean outputs folded (fold_constants)
+    if keep_paths:
+        present = _edges_present(net)
+        symbolic = [(sym.mask.T != 0).cpu() for sym in net.symbolic]
+        before = [k.cpu() | sym for k, sym in zip(keep, symbolic)]  # the paths left: kept numeric or symbolic edges
+        edges = [b.clone() for b in before]
+        _keep_paths(net.config, scores, present, edges, [torch.ones(w, dtype=torch.bool) for w in net.config.width_in])
+        keep = [k.cpu() | (e & ~b) for k, e, b in zip(keep, edges, before)]  # plus the edges given back
+    with torch.no_grad():
+        for l, layer in enumerate(net.layers):
+            old_mask = layer.mask
+            new_mask = (keep[l].to(old_mask.device) * old_mask).to(old_mask.dtype)
+            removed = (old_mask != 0) & (new_mask == 0)  # (in, out)
+            if fold_constants and removed.any():
+                _fold(net, l, (rec.edge_numeric[l].mean(dim=0).T * removed).sum(dim=0))
+            layer.mask.copy_(new_mask)
+
+
+def prune_edge(net, data, threshold=3e-2, *, output_weighting="sum", fold_constants=True, keep_paths=True):
     """a network whose numeric edges with attribution scores at most threshold are masked (their mean outputs over
-    data folded into the subnode biases with fold_constants)"""
+    data folded into the biases with fold_constants); with keep_paths every output that had a path from the inputs
+    keeps its best one; output_weighting as in prune_node"""
     rec, _ = recorded(net, data)
     scores = network_attribution(net, rec, per_output=False, output_weighting=output_weighting).edge
     new = copy.deepcopy(net)
-    with torch.no_grad():
-        for l, layer in enumerate(new.layers):
-            old_mask = layer.mask
-            new_mask = ((scores[l] > threshold).permute(1, 0) * old_mask).to(old_mask.dtype)
-            removed = (old_mask != 0) & (new_mask == 0)  # (in, out)
-            if fold_constants and removed.any():
-                mean_out = (rec.edge_numeric[l].mean(dim=0).T * removed).sum(dim=0)
-                new.subnode_bias[l].add_(new.subnode_scale[l] * mean_out.to(new.subnode_bias[l].dtype))
-            layer.mask.copy_(new_mask)
+    _mask_edges(new, rec, scores, [(scores[l] > threshold).T for l in range(net.depth)], fold_constants=fold_constants,
+                keep_paths=keep_paths)
     return new
 
 
-def prune(net, data, node_th=1e-2, edge_th=3e-2, *, output_weighting="mean", fold_constants=True,
+def prune_to_budget(net, data, evaluate, *, budget=0.02, fine_tune=None, step=0.25, min_step=1 / 64, max_rounds=100,
+                    output_weighting="sum", fold_constants=True, keep_paths=True, model=None):
+    """
+    Prunes net's numeric edges in place, as far as a validation budget allows. Each round masks the lowest-scoring
+    share `step` of the remaining numeric edges (attribution scores on data, every output keeping a path with
+    keep_paths; their mean outputs folded), calls fine_tune(net) (optional: a few epochs of the training loop, say)
+    and evaluate(net), a validation loss. A round whose loss stays within (1 + budget) times the loss of net as
+    given is kept; otherwise the state before it is restored and step halved, until step is below min_step,
+    max_rounds rounds have run or no edge can go (each edge left carries an output's path). model: the module whose
+    state a rejected round restores, when fine_tune trains more than net (the model that holds net's layers; default
+    net).
+
+    Returns a report: {"reference": loss as given, "limit", "loss": the kept state's, "edges": numeric edges left,
+    "rounds": [{"edges", "loss", "accepted", "step"}, ...], "disconnected": disconnected_outputs(net)}.
+    """
+    model = net if model is None else model
+    reference = float(evaluate(net))
+    limit = reference * (1 + budget) if reference >= 0 else reference * (1 - budget)
+    state, loss, rounds = copy.deepcopy(model.state_dict()), reference, []
+    while step >= min_step and len(rounds) < max_rounds:
+        live = sum(int((layer.mask != 0).sum()) for layer in net.layers)
+        n = int(step * live)
+        if n < 1:
+            break
+        rec, _ = recorded(net, data)
+        scores = network_attribution(net, rec, per_output=False, output_weighting=output_weighting).edge
+        flat = torch.cat([torch.where(layer.mask.T != 0, scores[l], torch.tensor(float("inf"), device=scores[l].device)
+                                      ).flatten() for l, layer in enumerate(net.layers)])
+        cut = torch.kthvalue(flat.float().cpu(), n).values
+        keep = [(scores[l].float() > cut.to(scores[l].device)).T for l in range(net.depth)]
+        _mask_edges(net, rec, scores, keep, fold_constants=fold_constants, keep_paths=keep_paths)
+        if n_edges(net) == live:  # every edge left carries an output's path
+            break
+        if fine_tune is not None:
+            fine_tune(net)
+        value = float(evaluate(net))
+        accepted = value == value and value <= limit
+        rounds.append({"edges": n_edges(net), "loss": value, "accepted": accepted, "step": step})
+        if accepted:
+            state, loss = copy.deepcopy(model.state_dict()), value
+        else:
+            model.load_state_dict(state)
+            step /= 2
+    return {"reference": reference, "limit": limit, "loss": loss, "edges": n_edges(net), "rounds": rounds,
+            "disconnected": disconnected_outputs(net)}
+
+
+def prune(net, data, node_th=1e-2, edge_th=3e-2, *, output_weighting="sum", fold_constants=True, keep_paths=True,
           prune_dead_nodes=True):
     """prune_node, then prune_edge, then (prune_dead_nodes) prune_node again for the nodes left without edges"""
-    kw = dict(output_weighting=output_weighting, fold_constants=fold_constants)
+    kw = dict(output_weighting=output_weighting, fold_constants=fold_constants, keep_paths=keep_paths)
     new = prune_edge(prune_node(net, data, node_th, **kw), data, edge_th, **kw)
     return prune_node(new, data, node_th, **kw) if prune_dead_nodes else new
 
 
-def prune_input(net, data, threshold=1e-2, *, keep=None, output_weighting="mean", fold_constants=True):
+def prune_input(net, data, threshold=1e-2, *, keep=None, output_weighting="sum", fold_constants=True, keep_paths=True):
     """
     A network without the inputs whose attribution score is at most threshold (keep: the inputs to keep, positions
     in the network's input layer); the network still takes the same input columns (input_id selects the kept
-    ones). fold_constants: the removed inputs' mean edge outputs move into the first layer's subnode biases.
+    ones). fold_constants: the removed inputs' mean edge outputs move into the first layer's biases. keep_paths (and
+    no keep): every output that had a path from the inputs keeps its best one. output_weighting as in prune_node.
     """
     rec, _ = recorded(net, data)
     if keep is None:
-        score = network_attribution(net, rec, per_output=False, output_weighting=output_weighting).node[0]
-        keep = torch.where(score > threshold)[0].tolist()
-        if not keep:
-            keep = [int(torch.argmax(score))]
+        attribution = network_attribution(net, rec, per_output=False, output_weighting=output_weighting)
+        mask = (attribution.node[0] > threshold).cpu()
+        if not mask.any():
+            mask[int(torch.argmax(attribution.node[0]))] = True
             warnings.warn(f"prune_input: no input is above threshold {threshold}; the most important one is kept")
+        if keep_paths:
+            edges = _edges_present(net)
+            _keep_paths(net.config, attribution.edge, edges, [e.clone() for e in edges],
+                        [mask] + [torch.ones(w, dtype=torch.bool) for w in net.width_in[1:]])
+        keep = torch.where(mask)[0].tolist()
     keep = [int(i) for i in keep]
     new = copy.deepcopy(net)
     if fold_constants:
@@ -206,8 +347,7 @@ def prune_input(net, data, threshold=1e-2, *, keep=None, output_weighting="mean"
         removed[keep] = False
         if removed.any():
             with torch.no_grad():
-                mean_out = rec.edge_outputs[0][:, :, removed].mean(dim=0).sum(dim=1)
-                new.subnode_bias[0].add_(new.subnode_scale[0] * mean_out.to(new.subnode_bias[0].dtype))
+                _fold(new, 0, rec.edge_outputs[0][:, :, removed].mean(dim=0).sum(dim=1))
     return reindex_nodes(new, 0, keep)
 
 
@@ -222,6 +362,7 @@ def refine(net, new_grid, data, refit_mode="sample"):
     new = KANNetwork.from_config(cfg, device=net.device, dtype=net.dtype)
     with torch.no_grad():
         for l, (layer, parent) in enumerate(zip(new.layers, net.layers)):
+            layer.out_of_grid = parent.out_of_grid  # a layer set apart from the network's options keeps its setting
             layer.initialize_grid_from_parent(parent, rec.inputs[l], mode=refit_mode)
             layer.scale_base.data = parent.scale_base.data.clone()
             layer.scale_sp.data = parent.scale_sp.data.clone()

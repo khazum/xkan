@@ -40,6 +40,15 @@ xKAN 1.0 starts from pykan 0.2.8 (pykan commit ecde4ec, January 2025). Code writ
   inputs.
 - Pruning folds the constant contributions of removed nodes and edges into biases and removes nodes left without
   edges. pykan dropped those contributions, which shifted the output.
+- The trainer's weight decay leaves the spline coefficients and scales alone (`Trainer(spline_weight_decay=0.)`). On
+  the denoising autoencoder, decay on them shrank the splines to zero and gave 1.57 times the deviance.
+  `spline_weight_decay=None` decays every parameter.
+- Attribution and pruning weigh every output 1 (`output_weighting='sum'`; pykan: 1 / outputs). On the autoencoder's
+  1000 genes pykan's weighting put every edge under the pruning thresholds: `prune_edge` left 3 of 256,000 edges, every
+  gene constant and 2.6 times the deviance. With `'sum'` it kept 70% of the edges (45% of the decoder's) at 1% more
+  deviance. Networks with one output score the same either way; `KANRegularizer` keeps pykan's weighting.
+- Pruning leaves every output a path from the inputs (`keep_paths=True`): an output whose edges all fall under the
+  threshold keeps its highest-scoring edge, and that edge's source its own, back to an input.
 
 ### Added
 
@@ -60,6 +69,38 @@ xKAN 1.0 starts from pykan 0.2.8 (pykan commit ecde4ec, January 2025). Code writ
   `widen_ranges`; `symbolic_formula(real=True)`; `compile_formula(..., **network_options)`.
 - `get_derivative` goes through `torch.func.functional_call`; pykan's version returned zero derivatives for the affine
   parameters.
+- `Trainer(spline_weight_decay=...)` puts the spline coefficients and scales in a parameter group of their own. Adam's
+  weight decay on them shrinks the spline scales to zero within a few epochs and leaves the base path alone; 0 keeps
+  the decay on the other parameters only.
+- `xkan.interp.spline_share` (the share of each layer's edge output that the splines carry), `outside_grid` (the
+  share of a layer's inputs beyond its grid) and `layer_inputs`, for any module built from KAN layers;
+  `xkan.train.SplineShare` records the spline shares during training, so a collapse shows.
+- `KANLayer(out_of_grid=...)`: what an edge does beyond its grid. `'zero'` (default) is pykan's: the spline fades to
+  zero and the base path extrapolates. `'soft_clamp'` saturates the input within one interval beyond the end, so every
+  edge is bounded; `'clamp'` holds the end value and passes no gradient beyond it. Grid updates and `refine` refit in
+  each mode's terms. Neither bounded mode is the default. Under `'clamp'` a deep network trained by Adam stalled, and
+  on 16 toy formula tasks (5 seeds each, tutorial-style training) its test RMSE was a median 1.31
+  times that of `'zero'`. `'soft_clamp'` matched `'zero'` there and was a median 0.87 times its RMSE outside the
+  training range, but did worse on three
+  tabular datasets (Adam, 200 epochs, grid updates in the first 50 steps; California RMSE 0.51 against 0.44). On a
+  single-cell denoising autoencoder `'soft_clamp'` gave 4.9% less deviance (20 of 20 replicate pairs). Most of that
+  came from the first grid update: its refit leaves the initial edges saturating beyond the initial grid, where
+  `'zero'` leaves them linear. Linear tails, a margin around the grid, a tanh map of every input, a straight-through
+  clamp and knots placed on winsorised samples were tried as well. None did better than `'zero'` in general or than
+  `'soft_clamp'` on the autoencoder, so they are not included.
+- `ElementwiseKANLayer`: one edge per input, `y_i = phi_i(x_i)`, a learned link per feature.
+- `xkan.nn.Ensemble` and `fit_ensemble`: several fitted members, the best kept by a validation score, their predictions
+  averaged; `Ensemble.agreement` measures how alike the members are.
+- `xkan.interp.prune_to_budget`: rounds of pruning, each fine-tuned and kept while a validation loss stays within a
+  budget. On the autoencoder a 2% budget on the error at validation entries hidden from the input kept 24% of the
+  edges at unchanged deviance (10 replicate pairs). A reconstruction loss is the wrong budget there: it let pruning
+  go to 0.6% of the edges while the deviance rose 20%.
+- `xkan.interp.disconnected_outputs`: the outputs that no path joins to an input.
+- `xkan.losses.OutputSparsity`: a group lasso over each output's incoming edges, divided by the output's size, so it
+  concentrates every output on few inputs without shrinking it. With weight 2e-3 on the autoencoder's decoder,
+  budget pruning kept 27% fewer edges at the same deviance; 2e-2 cost 4% deviance.
+- Pruning folds into a layer's own bias when it has one (`bias=True`), so models that call the layers directly keep
+  the folded constants.
 
 ### Fixed
 
@@ -80,6 +121,9 @@ xKAN 1.0 starts from pykan 0.2.8 (pykan commit ecde4ec, January 2025). Code writ
 - The symbolic branch (#92, #130, #137, #174, #185, #287, #404, #432, #433, #451, #532, #533, #550, #553, #564):
   singularity-avoiding forms with finite gradients, masked NaNs, multiplication nodes of any arity in formulas.
 - Pruning (#149, #416), Adam's learning rate (#342), real formulas (#289), the a-range (#529).
+- `refine` under a bounded `out_of_grid` refits the parent's curves as the parent evaluates them and fits the new
+  ones as the new layer evaluates them; with the finer grid's narrower outer intervals the two differ beyond the
+  range.
 - `plot_tree` ignored its variable names. `augment_input` works on data dicts. Formulas and plots name the input
   columns a network keeps after `prune_input`. `ex_round` printed values of one unit in the last digit as `0.e-2`,
   because SymPy's rounding kept 3 bits of them.
@@ -92,6 +136,13 @@ xKAN 1.0 starts from pykan 0.2.8 (pykan commit ecde4ec, January 2025). Code writ
   functions on 600 benchmark edges.
 - On the CPU, the RBF, RSWAF and Chebyshev bases train about 3x faster than B-splines, and the `'edge_weights'`
   regulariser runs about 15x faster than the recorded ones.
+- `model.compile()` (torch.compile) made training steps 1.8 to 4.1 times faster on an H100 and halved their peak
+  memory, from networks of 1000 x 128 x 1000 at batch 256 to 256 x 256 x 256 x 256 at batch 16,384. The first step
+  compiles (2 to 12 s). Compiled networks match eager ones through grid updates and mask edits.
+- The MatrixKAN basis (Coffman and Chen, arXiv 2502.07176) was measured and not adopted. On xKAN's non-uniform grids
+  each knot interval needs its own matrix, gathered per input value. That made the basis 0.4 to 0.9 times as fast as
+  the Cox-de Boor recursion at orders 2 and 3 and grid 3 or 5; it was faster only from order 3 with grid 10 or
+  order 5. The compiled recursion beat it at every size measured.
 
 ### Removed
 

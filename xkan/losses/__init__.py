@@ -154,9 +154,9 @@ class KANRegularizer:
             return [record.edge_std(l, numeric=True) for l in range(network.depth)]
         if self.metric == "edge_forward_sum":
             return [record.edge_scale(l) for l in range(network.depth)]
-        if self.metric == "edge_backward":
-            return network_attribution(network, record, per_output=False).edge
-        return node_attribution(network, record)
+        if self.metric == "edge_backward":  # pykan's weighting of the outputs
+            return network_attribution(network, record, per_output=False, output_weighting="mean").edge
+        return node_attribution(network, record, output_weighting="mean")
 
     def value(self, model, rec=None):
         """the unweighted value"""
@@ -217,5 +217,44 @@ class CoefSmoothness(KANRegularizer):
         super().__init__(weight, l1=0., entropy=0., coefdiff=1.)
 
 
+class OutputSparsity:
+    """
+    A group lasso over each output's incoming edges, one group per edge, times weight: per KAN layer the mean over
+    its outputs j of sum_i g_ij / sqrt(sum_i g_ij^2), g_ij = sqrt(scale_base_ij^2 + scale_sp_ij^2 * mean coef_ij^2)
+    the size of edge (i, j)'s weights (masked edges 0). Divided by the output's own size (normalize=True, default),
+    the term lies between 1 (one edge) and sqrt(in_dim) (equal edges) and does not change when an output's edges
+    scale together: it concentrates every output on few inputs without shrinking large outputs more than small ones
+    (normalize=False: sum_ij g_ij, the plain group lasso). From the weights alone, no activations recorded.
+
+    layers : the KAN layers to penalise (default every KANLayer of the model)
+    """
+
+    name = "output_sparsity"
+    requires_recording = False
+
+    def __init__(self, weight=1., *, layers=None, normalize=True, eps=1e-8):
+        self.weight, self.layers, self.normalize, self.eps = weight, layers, normalize, eps
+
+    def value(self, model, rec=None):
+        from ..layers import KANLayer
+        layers = self.layers if self.layers is not None else [m for m in model.modules() if isinstance(m, KANLayer)]
+        total = None
+        for layer in layers:
+            g = torch.sqrt(layer.scale_base ** 2 + layer.scale_sp ** 2 * layer.coef.pow(2).mean(dim=-1) + self.eps)
+            g = g * (layer.mask != 0)  # (in, out)
+            if self.normalize:
+                v = torch.mean(g.sum(dim=0) / torch.sqrt((g ** 2).sum(dim=0) + self.eps))
+            else:
+                v = g.sum()
+            total = v if total is None else total + v
+        if total is None:
+            p = next(model.parameters())
+            total = torch.zeros((), device=p.device, dtype=p.dtype)
+        return total
+
+    def __call__(self, model, rec=None):
+        return self.weight * self.value(model, rec)
+
+
 __all__ = ["CompositeLoss", "Term", "FunctionalTerm", "MSE", "mse", "CrossEntropy", "PoissonNLL", "KANRegularizer",
-           "REG_METRICS", "EdgeL1", "EdgeEntropy", "CoefL1", "CoefSmoothness"]
+           "REG_METRICS", "EdgeL1", "EdgeEntropy", "CoefL1", "CoefSmoothness", "OutputSparsity"]

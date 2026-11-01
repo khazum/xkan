@@ -57,6 +57,13 @@ class KANLayer(torch.nn.Module):
             aggregation : 'sum' (default) or 'mean' (each edge times 1 / in_dim, the in_dim at construction; a pruned
                 layer keeps its parent's factor)
             bias : a per-output bias (default False)
+            out_of_grid : an input outside the grid's inner range [grid[:, k], grid[:, -k - 1]]: 'zero' (default,
+                pykan's) leaves the spline at its incomplete basis there (zero beyond the outer knots) and the base
+                path unbounded; 'soft_clamp' evaluates the whole edge at the input saturated within the first interval
+                beyond the end (squash_to_grid: bounded outputs, a gradient that fades); 'clamp' at the input clamped
+                to the range (constant beyond it: inputs that move past the grid between grid updates get no
+                gradient, which can stall a deep network). The bounded modes refit in their own terms at grid updates
+                and refine.
 
     Parameters: grid (in_dim, num + 2k + 1, frozen), coef (in_dim, out_dim, num + k), scale_base, scale_sp and mask
     (in_dim, out_dim; mask frozen), bias (out_dim) when on; buffer agg_scale for 'mean'.
@@ -112,6 +119,7 @@ class KANLayer(torch.nn.Module):
         else:
             self.agg_scale = 1.0
         self.bias = torch.nn.Parameter(torch.zeros(out_dim)) if cfg.bias else None
+        self.out_of_grid = cfg.out_of_grid
         self._dropkan_generator = None  # set by a training loop for its training forwards (xkan.train.Trainer)
 
     @property
@@ -119,7 +127,8 @@ class KANLayer(torch.nn.Module):
         """the layer's options as they are now (dimensions and grid-update options included)"""
         return replace(self._config, in_dim=self.in_dim, out_dim=self.out_dim, basis=self.basis, grid_eps=self.grid_eps,
                        refit_guard=self.refit_guard, knot_placement=self.knot_placement, min_knot_gap=self.min_knot_gap,
-                       dropkan=self.dropkan, aggregation=self.aggregation, bias=self.bias is not None)
+                       dropkan=self.dropkan, aggregation=self.aggregation, bias=self.bias is not None,
+                       out_of_grid=self.out_of_grid)
 
     @property
     def device(self):
@@ -129,6 +138,43 @@ class KANLayer(torch.nn.Module):
         """the basis values (batch, in_dim, num + k) of x on grid (default the layer's)"""
         return basis_values(x, self.grid if grid is None else grid, self.k, self.basis, self.num)
 
+    def clamp_to_grid(self, x, grid=None):
+        """x (batch, in_dim) clamped per input to the inner range of grid (default the layer's)"""
+        g = self.grid if grid is None else grid
+        return torch.clamp(x, g[:, self.k].to(x.dtype), g[:, -self.k - 1].to(x.dtype))
+
+    def squash_to_grid(self, x, grid=None):
+        """x (batch, in_dim) inside the inner range of grid (default the layer's) as it is; beyond an end e, e + h *
+        tanh((x - e) / h), h the width of the first interval beyond e: the input saturates within that interval, its
+        derivative 1 at e and decaying beyond (order 0: the hard clamp)"""
+        g = self.grid if grid is None else grid
+        k = self.k
+        if k == 0:
+            return self.clamp_to_grid(x, g)
+        lo, hi = g[:, k].to(x.dtype), g[:, -k - 1].to(x.dtype)
+        h_lo = (g[:, k] - g[:, k - 1]).clamp(min=1e-6).to(x.dtype)
+        h_hi = (g[:, -k] - g[:, -k - 1]).clamp(min=1e-6).to(x.dtype)
+        above = hi + h_hi * torch.tanh((x - hi) / h_hi)
+        below = lo - h_lo * torch.tanh((lo - x) / h_lo)
+        return torch.where(x > hi, above, torch.where(x < lo, below, x))
+
+    def _bounded(self, x, grid=None):
+        """x (batch, in_dim) as the edges evaluate it under out_of_grid, on grid (default the layer's)"""
+        if self.out_of_grid == "zero":
+            return x
+        g = self.grid if grid is None else grid
+        return self.squash_to_grid(x, g) if self.out_of_grid == "soft_clamp" else self.clamp_to_grid(x, g)
+
+    def _spline_basis(self, x, grid=None):
+        """the basis values (batch, in_dim, num + k) the splines of the edges take for inputs x under out_of_grid, on
+        grid (default the layer's)"""
+        g = self.grid if grid is None else grid
+        return basis_values(self._bounded(x, g), g, self.k, self.basis, self.num)
+
+    def _base_values(self, x, grid=None):
+        """the base path's values (batch, in_dim) b(.) for inputs x under out_of_grid, on grid (default the layer's)"""
+        return self.base_fun(self._bounded(x, grid))
+
     def _dropkan_active(self):
         return self.dropkan > 0. and self.training
 
@@ -137,6 +183,7 @@ class KANLayer(torch.nn.Module):
         if return_edges or self._dropkan_active():
             edges = self._edge_values(x)  # (DropKAN masks individual edges)
             return edges if return_edges else edges.y
+        x = self._bounded(x)
         basis = self.basis_values(x).flatten(start_dim=1)  # (batch, in_dim * (num + k))
         w = (self.coef * (self.scale_sp * self.mask)[:, :, None]).permute(1, 0, 2).flatten(start_dim=1)  # (out, in * (num + k))
         y = torch.nn.functional.linear(basis, w) + self.base_fun(x) @ (self.scale_base * self.mask)
@@ -153,8 +200,8 @@ class KANLayer(torch.nn.Module):
     def _edge_values(self, x):
         batch = x.shape[0]
         preacts = x[:, None, :].clone().expand(batch, self.out_dim, self.in_dim)
-        base = self.base_fun(x)  # (batch, in_dim)
-        y = torch.einsum("ijk,jlk->ijl", self.basis_values(x), self.coef)  # (batch, in_dim, out_dim)
+        base = self._base_values(x)  # (batch, in_dim)
+        y = torch.einsum("ijk,jlk->ijl", self._spline_basis(x), self.coef)  # (batch, in_dim, out_dim)
         postspline = y.clone().permute(0, 2, 1)
         y = self.scale_base[None, :, :] * base[:, :, None] + self.scale_sp[None, :, :] * y
         y = self.mask[None, :, :] * y
@@ -180,6 +227,21 @@ class KANLayer(torch.nn.Module):
         if basis == "bspline" and self.basis == "bspline":
             return refit_coef(x, grid, coef, k, new_grid, self.k)
         return refit_coef_bases(basis_values(x, grid, k, basis), basis_values(x, new_grid, self.k, self.basis, self.num), coef)
+
+    def _refit_mapped(self, x_pos, old_basis, old_base, old_coef):
+        # under a bounded out_of_grid, the coefficients on this layer's grid of the old curves as the old edges
+        # evaluate them at x_pos (their basis values old_basis, base path old_base), the new coefficients fitted to
+        # them as this layer's edges evaluate x_pos
+        new_basis = self._spline_basis(x_pos)
+        coef = refit_coef_bases(old_basis, new_basis, old_coef)
+        # where the base path's value moves with the grid, its change, fitted on the new basis, goes into each edge's
+        # spline in the ratio of the edge's base and spline scales (edges with a spline scale below 1e-3 keep their
+        # spline)
+        delta = (old_base - self._base_values(x_pos))[:, :, None]  # (batch, in_dim, 1)
+        d_coef = refit_coef_bases(delta, new_basis, torch.ones_like(old_coef[:, :1, :1]))  # (in_dim, 1, n)
+        sp = self.scale_sp.data
+        ratio = torch.where(sp.abs() >= 1e-3, self.scale_base.data / torch.where(sp.abs() >= 1e-3, sp, 1.), 0.)
+        return coef + ratio[:, :, None] * d_coef
 
     @staticmethod
     def _with_uniform_points(x_pos, n):
@@ -217,8 +279,13 @@ class KANLayer(torch.nn.Module):
         elif mode == "sample+uniform":
             x_pos = self._with_uniform_points(x_pos, 4 * (num + self.k))
         old_grid, old_coef = self.grid.data.clone(), self.coef.data.clone()
+        if self.out_of_grid != "zero":
+            old_basis, old_base = self._spline_basis(x_pos, old_grid), self._base_values(x_pos, old_grid)
         self.grid.data = new_grid
-        self.coef.data = self._refit_from(x_pos, old_grid, old_coef, self.k, self.basis, self.grid.data)
+        if self.out_of_grid == "zero":
+            self.coef.data = self._refit_from(x_pos, old_grid, old_coef, self.k, self.basis, self.grid.data)
+        else:
+            self.coef.data = self._refit_mapped(x_pos, old_basis, old_base, old_coef)
         if self.refit_guard is not None:
             old_max = old_coef.abs().amax(dim=(1, 2))
             new_max = self.coef.data.abs().amax(dim=(1, 2))
@@ -232,7 +299,8 @@ class KANLayer(torch.nn.Module):
         """
         this layer's grid from a parent layer's (usually coarser): the parent's interior knots interpolated linearly to
         this layer's number of intervals; the coefficients fitted to the parent's curves at x (mode as in
-        update_grid_from_samples)
+        update_grid_from_samples). Under a bounded out_of_grid the parent's curves are taken as its edges evaluate
+        them, and this layer takes the parent's scales (the base path's change goes into the splines in their ratio).
         """
         x_pos = torch.sort(x, dim=0)[0]
         num = self.grid.shape[1] - 1 - 2 * self.k
@@ -242,8 +310,8 @@ class KANLayer(torch.nn.Module):
             # helper layer, in the parent's dtype; its random initial values unused, drawn on a forked stream)
             knots = parent.grid[:, parent.k:-parent.k]
             with torch.random.fork_rng(devices=[]):
-                sp2 = KANLayer(1, self.in_dim, num=knots.shape[1] - 1, k=1, scale_base_mu=0.0, scale_base_sigma=0.0
-                               ).to(device=x.device, dtype=parent.grid.dtype)
+                sp2 = KANLayer(1, self.in_dim, num=knots.shape[1] - 1, k=1, scale_base_mu=0.0, scale_base_sigma=0.0,
+                               out_of_grid="zero").to(device=x.device, dtype=parent.grid.dtype)
             sp2.coef.data = curve2coef(sp2.grid[:, sp2.k:-sp2.k].permute(1, 0).expand(-1, self.in_dim),
                                        knots.permute(1, 0).unsqueeze(dim=2), sp2.grid[:, :], k=1).permute(1, 0, 2)
             percentile = torch.linspace(-1, 1, n + 1).to(device=self.device, dtype=sp2.coef.dtype)
@@ -257,7 +325,13 @@ class KANLayer(torch.nn.Module):
         elif mode != "sample":
             raise ValueError(f"unknown refit mode {mode!r}; 'sample', 'sample+uniform' or 'grid'")
         self.grid.data = extend_grid(grid, k_extend=self.k)
-        self.coef.data = self._refit_from(x_pos, parent.grid, parent.coef, parent.k, parent.basis, self.grid.data)
+        if self.out_of_grid == "zero" and parent.out_of_grid == "zero":
+            self.coef.data = self._refit_from(x_pos, parent.grid, parent.coef, parent.k, parent.basis, self.grid.data)
+        else:
+            with torch.no_grad():
+                self.scale_base.data, self.scale_sp.data = parent.scale_base.data.clone(), parent.scale_sp.data.clone()
+                self.coef.data = self._refit_mapped(x_pos, parent._spline_basis(x_pos), parent._base_values(x_pos),
+                                                    parent.coef.data)
 
     # ------------------------------------------------------------------------------------------------- structure
 

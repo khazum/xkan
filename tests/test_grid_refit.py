@@ -1,4 +1,5 @@
-"""Grid refits of a layer: zero-inflated (tied) samples, refit_guard, refit mode 'sample+uniform'."""
+"""Grid refits of a layer: zero-inflated (tied) samples, refit_guard, refit mode 'sample+uniform' (out_of_grid 'zero':
+the least-squares refit of the curves themselves; the bounded modes in test_out_of_grid)."""
 import pytest
 import torch
 
@@ -14,7 +15,7 @@ def refit(nonzero=3, mode="sample", guard=None, device="cpu", k=2, num=3, seed=0
     samples); the largest coefficient before / after and the largest change of the curves over the samples' range and
     at the samples"""
     torch.manual_seed(seed)
-    layer = KANLayer(in_dim=in_dim, out_dim=4, num=num, k=k, device=device, refit_guard=guard)
+    layer = KANLayer(in_dim=in_dim, out_dim=4, num=num, k=k, device=device, refit_guard=guard, out_of_grid="zero")
     if nonzero:
         x = torch.zeros(32, in_dim)
         x[:nonzero] = torch.rand(nonzero, in_dim) * 3
